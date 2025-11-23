@@ -1,0 +1,212 @@
+import requests
+import pandas as pd
+import time
+import os
+from datetime import datetime
+
+
+DATA_DIR = "data"
+
+
+
+def get_top_1000_symbols():
+    print("Getting top 1000 coins from CoinGecko")
+
+    symbols = []
+
+    for page in range(1, 5):
+        url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": 250,
+            "page": page
+        }
+
+        data = requests.get(url, params=params).json()
+
+        for coin in data:
+            symbols.append(coin["symbol"].upper())
+
+        time.sleep(0.30)
+
+    print(f"Success! Total coins fetched: {len(symbols)}")
+    return symbols[:1000]
+
+
+
+def load_binance_pairs():
+    print("Getting Binance trading pairs")
+    url = "https://api.binance.com/api/v3/exchangeInfo"
+    data = requests.get(url).json()
+
+    available = set(s["symbol"] for s in data.get("symbols", []))
+
+    print(f"Loaded {len(available)} Binance symbol pairs.\n")
+    return available
+
+
+def is_on_binance(symbol, binance_pairs):
+    return symbol + "USDT" in binance_pairs
+
+
+def download_binance_history(symbol):
+    pair = symbol + "USDT"
+    print(f"[{pair}] Getting Binance history")
+
+    base_url = "https://api.binance.com/api/v3/klines"
+    all_rows = []
+
+    start_time = 0
+    now = int(time.time() * 1000)
+
+    while True:
+        params = {
+            "symbol": pair,
+            "interval": "1d",
+            "limit": 1000,
+            "startTime": start_time
+        }
+
+        data = requests.get(base_url, params=params).json()
+
+        if not isinstance(data, list) or len(data) == 0:
+            break
+
+        all_rows.extend(data)
+        start_time = data[-1][0] + 1
+
+        if start_time >= now:
+            break
+
+        time.sleep(0.05)
+
+    if not all_rows:
+        print(f"[{pair}] No data on Binance.")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows, columns=[
+        "open_time", "open", "high", "low", "close",
+        "volume", "close_time", "quote_volume",
+        "num_trades", "taker_base", "taker_quote", "ignore"
+    ])
+
+    df["date"] = pd.to_datetime(df["open_time"], unit="ms")
+    return df[["date", "open", "high", "low", "close", "volume"]]
+
+
+def load_kraken_pairs():
+    print("Getting Kraken trading pairs")
+    url = "https://api.kraken.com/0/public/AssetPairs"
+    data = requests.get(url).json()
+
+    if "result" not in data:
+        return set()
+
+    pairs = set(data["result"].keys())
+    print(f"Loaded {len(pairs)} Kraken symbol pairs.\n")
+    return pairs
+
+
+def to_kraken_symbol(symbol):
+    if symbol == "BTC":
+        return "XBTUSD"
+    return symbol.upper() + "USD"
+
+
+def is_on_kraken(symbol, kraken_pairs):
+    return to_kraken_symbol(symbol) in kraken_pairs
+
+
+def download_kraken_history(symbol):
+    pair = to_kraken_symbol(symbol)
+    print(f"[{pair}] Getting Kraken history")
+
+    url = "https://api.kraken.com/0/public/OHLC"
+    params = {"pair": pair, "interval": 1440}
+
+    data = requests.get(url, params=params).json()
+
+    if "result" not in data or pair not in data["result"]:
+        print(f"[{pair}] No Kraken data.")
+        return pd.DataFrame()
+
+    rows = data["result"][pair]
+
+    time.sleep(0.05)  # Slow slightly
+
+    df = pd.DataFrame(rows, columns=[
+        "time", "open", "high", "low", "close",
+        "vwap", "volume", "count"
+    ])
+
+    df["date"] = pd.to_datetime(df["time"], unit="s")
+    return df[["date", "open", "high", "low", "close", "volume"]]
+
+
+
+def clean_data(df):
+    if df.empty:
+        return df
+
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df.dropna().drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+
+
+def save_csv(symbol, df):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    filename = f"{DATA_DIR}/{symbol}.csv"
+
+    if not os.path.exists(filename):
+        df.to_csv(filename, index=False)
+        print(f"[{symbol}] NEW CSV saved with ({len(df)} rows).")
+        return
+
+    old_df = pd.read_csv(filename)
+    old_df["date"] = pd.to_datetime(old_df["date"])
+
+    combined = pd.concat([old_df, df]).drop_duplicates(subset=["date"]).sort_values("date")
+    combined.to_csv(filename, index=False)
+
+    print(f"[{symbol}] CSV UPDATED with ({len(combined)} rows).")
+
+
+
+def main():
+    print("\n=== STARTING APPLICATION ===\n")
+    start_total = time.time()
+
+    symbols = get_top_1000_symbols()
+    binance_pairs = load_binance_pairs()
+    kraken_pairs = load_kraken_pairs()
+
+    for symbol in symbols:
+
+        if is_on_binance(symbol, binance_pairs):
+            df = download_binance_history(symbol)
+
+        elif is_on_kraken(symbol, kraken_pairs):
+            df = download_kraken_history(symbol)
+
+        else:
+            print(f"[{symbol}] Not on Binance or Kraken.")
+            time.sleep(0.15)
+            continue
+
+        df = clean_data(df)
+        if not df.empty:
+            save_csv(symbol, df)
+
+        time.sleep(0.15)
+
+        print("")
+
+    total = time.time() - start_total
+    mins, secs = divmod(total, 60)
+    print(f"=== FINISHED in {int(mins)}m {int(secs)}s ===")
+
+
+if __name__ == "__main__":
+    main()
